@@ -6,13 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
-	"net/http/httptest"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,9 +20,7 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
-	"golang.org/x/sync/singleflight"
 	"golang.org/x/time/rate"
 )
 
@@ -54,12 +50,13 @@ var (
 
 // 1. Struktur Data dengan Stale & Expires
 type CacheItem struct {
-	Body        []byte    `json:"body"`
-	ContentType string    `json:"content_type"`
-	StatusCode  int       `json:"status_code"`
-	CachedAt    time.Time `json:"cached_at"`
-	StaleAt     time.Time `json:"stale_at"`
-	ExpiresAt   time.Time `json:"expires_at"`
+	Body        []byte      `json:"body"`
+	ContentType string      `json:"content_type"`
+	Header      http.Header `json:"header"`
+	StatusCode  int         `json:"status_code"`
+	CachedAt    time.Time   `json:"cached_at"`
+	StaleAt     time.Time   `json:"stale_at"`
+	ExpiresAt   time.Time   `json:"expires_at"`
 }
 
 // 2. Cache Interface
@@ -166,49 +163,58 @@ func (c *RedisCache) Add(key string, item CacheItem) {
 	}
 }
 
-func (c *RedisCache) IncHits()                       { atomic.AddUint64(&c.Hits, 1) }
-func (c *RedisCache) IncMisses()                     { atomic.AddUint64(&c.Misses, 1) }
-func (c *RedisCache) IncStaleRefresh()               { atomic.AddUint64(&c.StaleRefresh, 1) }
+func (c *RedisCache) IncHits()         { atomic.AddUint64(&c.Hits, 1) }
+func (c *RedisCache) IncMisses()       { atomic.AddUint64(&c.Misses, 1) }
+func (c *RedisCache) IncStaleRefresh() { atomic.AddUint64(&c.StaleRefresh, 1) }
 
 func (c *RedisCache) GetMetrics() map[string]interface{} {
 	return map[string]interface{}{
-		"type":              "Redis",
-		"total_hits":        atomic.LoadUint64(&c.Hits),
-		"total_misses":      atomic.LoadUint64(&c.Misses),
-		"stale_refreshes":   atomic.LoadUint64(&c.StaleRefresh),
+		"type":            "Redis",
+		"total_hits":      atomic.LoadUint64(&c.Hits),
+		"total_misses":    atomic.LoadUint64(&c.Misses),
+		"stale_refreshes": atomic.LoadUint64(&c.StaleRefresh),
 	}
 }
 
 // 3. Rate Limiter: Bouncer Pintu (Elak DDoS dari 1 IP)
 type IPRateLimiter struct {
-	ips map[string]*rate.Limiter
-	mu  sync.RWMutex
-	r   rate.Limit
-	b   int
+	ips  map[string]*rate.Limiter
+	seen map[string]time.Time
+	mu   sync.RWMutex
+	r    rate.Limit
+	b    int
 }
 
 func NewIPRateLimiter(r rate.Limit, b int) *IPRateLimiter {
 	return &IPRateLimiter{
-		ips: make(map[string]*rate.Limiter),
-		r:   r,
-		b:   b,
+		ips:  make(map[string]*rate.Limiter),
+		seen: make(map[string]time.Time),
+		r:    r,
+		b:    b,
 	}
 }
 
 func (i *IPRateLimiter) GetLimiter(ip string) *rate.Limiter {
-	i.mu.RLock()
-	limiter, exists := i.ips[ip]
-	i.mu.RUnlock()
-
-	if !exists {
-		i.mu.Lock()
-		limiter, exists = i.ips[ip]
-		if !exists {
-			limiter = rate.NewLimiter(i.r, i.b) // Contoh: 100 limit, 50 burst
-			i.ips[ip] = limiter
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	now := time.Now()
+	if len(i.ips) >= 10000 {
+		for key, last := range i.seen {
+			if now.Sub(last) > 5*time.Minute {
+				delete(i.ips, key)
+				delete(i.seen, key)
+			}
 		}
-		i.mu.Unlock()
+		if _, exists := i.ips[ip]; len(i.ips) >= 10000 && !exists {
+			return rate.NewLimiter(0, 0)
+		}
 	}
+	limiter, exists := i.ips[ip]
+	if !exists {
+		limiter = rate.NewLimiter(i.r, i.b)
+		i.ips[ip] = limiter
+	}
+	i.seen[ip] = now
 	return limiter
 }
 
@@ -240,7 +246,7 @@ func NewLoadBalancer(urls []string) *LoadBalancer {
 	var upstreams []*Upstream
 	for _, u := range urls {
 		parsed, err := url.Parse(strings.TrimSpace(u))
-		if err == nil {
+		if err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "" {
 			upstreams = append(upstreams, &Upstream{URL: parsed, Alive: true})
 		}
 	}
@@ -313,25 +319,16 @@ func NewCircuitBreaker(threshold int, timeout time.Duration) *CircuitBreaker {
 }
 
 func (cb *CircuitBreaker) AllowRequest() bool {
-	cb.mu.RLock()
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
 	if cb.state == StateClosed {
-		cb.mu.RUnlock()
 		return true
 	}
-	if cb.state == StateOpen {
-		if time.Since(cb.lastFailure) > cb.resetTimeout {
-			cb.mu.RUnlock()
-			cb.mu.Lock()
-			cb.state = StateHalfOpen
-			cb.mu.Unlock()
-			return true
-		}
-		cb.mu.RUnlock()
-		return false
+	if cb.state == StateOpen && time.Since(cb.lastFailure) > cb.resetTimeout {
+		cb.state = StateHalfOpen
+		return true
 	}
-	// Half-Open
-	cb.mu.RUnlock()
-	return true
+	return false
 }
 
 func (cb *CircuitBreaker) RecordSuccess() {
@@ -373,9 +370,20 @@ func main() {
 
 	upstreamsFlag := flag.String("upstreams", defaultUpstreams, "Comma-separated upstream URLs")
 	portFlag := flag.String("port", defaultPort, "Proxy listening port")
-	ttlFlag := flag.Int("ttl", 60, "Cache TTL (Expires) in seconds")
+	defaultTTL := 60
+	if value := os.Getenv("LUMINA_CACHE_TTL_SECONDS"); value != "" {
+		var err error
+		defaultTTL, err = strconv.Atoi(value)
+		if err != nil || defaultTTL <= 0 {
+			log.Fatal("Invalid LUMINA_CACHE_TTL_SECONDS")
+		}
+	}
+	ttlFlag := flag.Int("ttl", defaultTTL, "Cache TTL (Expires) in seconds")
 	staleFlag := flag.Int("stale", 30, "Cache Stale in seconds")
 	flag.Parse()
+	if *ttlFlag <= 0 || *staleFlag < 0 || *staleFlag > *ttlFlag {
+		log.Fatal("Require 0 <= stale <= ttl and ttl > 0")
+	}
 
 	urls := strings.Split(*upstreamsFlag, ",")
 	lb := NewLoadBalancer(urls)
@@ -391,7 +399,7 @@ func main() {
 	var cache CacheBackend
 	redisURL := os.Getenv("LUMINA_REDIS_URL")
 	if redisURL != "" {
-		fmt.Printf("🔄 Memulakan sambungan ke Redis: %s\n", redisURL)
+		fmt.Println("Connecting to Redis")
 		rCache, err := NewRedisCache(redisURL)
 		if err != nil {
 			log.Fatalf("Gagal sambung ke Redis: %v", err)
@@ -407,158 +415,13 @@ func main() {
 	// Setup Circuit Breaker (Threshold 5 kegagalan, Reset selepas 10 saat)
 	cb := NewCircuitBreaker(5, 10*time.Second)
 
-	proxy := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			target := lb.Next()
-			if target == nil {
-				req.URL.Scheme = "http"
-				req.URL.Host = "offline.local"
-				req.Host = "offline.local"
-				return
-			}
-			req.URL.Scheme = target.URL.Scheme
-			req.URL.Host = target.URL.Host
-			req.Host = target.URL.Host
-		},
-	}
-
-	var requestGroup singleflight.Group
-
-	// Helper function untuk tarik dari upstream
-	fetchAndUpdateCache := func(r *http.Request, cacheKey string) (CacheItem, error) {
-		rec := httptest.NewRecorder()
-		proxy.ServeHTTP(rec, r)
-
-		res := rec.Result()
-		body := rec.Body.Bytes()
-
-		item := CacheItem{
-			Body:        body,
-			ContentType: res.Header.Get("Content-Type"),
-			StatusCode:  res.StatusCode,
-			CachedAt:    time.Now(),
-			StaleAt:     time.Now().Add(staleTTL),
-			ExpiresAt:   time.Now().Add(ttl),
-		}
-
-		if res.Header.Get("Set-Cookie") == "" && res.StatusCode >= 200 && res.StatusCode < 300 && len(body) > 0 {
-			cache.Add(cacheKey, item)
-			cb.RecordSuccess()
-		} else if res.StatusCode >= 500 {
-			cb.RecordFailure()
-		}
-		return item, nil
-	}
-
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		promRequestsTotal.Inc()
-
-		// 1. Rate Limiting Check
-		ip, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			ip = r.RemoteAddr
-		}
-		if !limiter.GetLimiter(ip).Allow() {
-			http.Error(w, "429 Too Many Requests - Sabar bang!", http.StatusTooManyRequests)
-			return
-		}
-
-		// 2. Metrics Endpoint (Prometheus / JSON Fallback)
-		if r.URL.Path == "/metrics" {
-			promhttp.Handler().ServeHTTP(w, r)
-			return
-		}
-		if r.URL.Path == "/lumina-metrics" {
-			w.Header().Set("Content-Type", "application/json")
-			metrics := cache.GetMetrics()
-			metrics["uptime_seconds"] = time.Since(serverStartTime).Seconds()
-			json.NewEncoder(w).Encode(metrics)
-			return
-		}
-
-		if r.Method != http.MethodGet {
-			w.Header().Set("X-Lumina-Cache", "MISS")
-			proxy.ServeHTTP(w, r)
-			return
-		}
-
-		cacheKey := "lumina:" + r.URL.RequestURI()
-		item, status := cache.GetStatus(cacheKey)
-
-		// 3. Circuit Breaker Check
-		if !cb.AllowRequest() {
-			// Kalau circuit OPEN, cuba serve stale data kalau ada
-			if status == "STALE" || status == "HIT" {
-				w.Header().Set("Content-Type", item.ContentType)
-				w.Header().Set("X-Lumina-Cache", status+"-CB")
-				w.WriteHeader(item.StatusCode)
-				_, _ = w.Write(item.Body)
-				return
-			}
-			http.Error(w, "503 Service Unavailable - Circuit Open!", http.StatusServiceUnavailable)
-			return
-		}
-
-		// 4. HIT & STALE-WHILE-REVALIDATE Logic
-		if status == "HIT" || status == "STALE" {
-			w.Header().Set("Content-Type", item.ContentType)
-			w.Header().Set("X-Lumina-Cache", status)
-
-			if status == "HIT" {
-				cache.IncHits()
-				promCacheHits.Inc()
-				// fmt.Printf("[HIT  ] %s %s | %d µs\n", r.Method, r.URL.RequestURI(), time.Since(start).Microseconds())
-			} else {
-				cache.IncStaleRefresh()
-				promStaleRefreshes.Inc()
-				// fmt.Printf("[STALE] %s %s | serving old data & refreshing background! | %d µs\n", r.Method, r.URL.RequestURI(), time.Since(start).Microseconds())
-
-				// Stale: Jalan background fetch supaya user seterusnya dapat data baru
-				go func() {
-					bgReq := r.Clone(context.Background())
-					requestGroup.Do("bg:"+cacheKey, func() (interface{}, error) {
-						return fetchAndUpdateCache(bgReq, cacheKey)
-					})
-				}()
-			}
-
-			w.WriteHeader(item.StatusCode)
-			_, _ = w.Write(item.Body)
-			return
-		}
-
-		// 4. MISS dengan Singleflight
-		v, err, shared := requestGroup.Do(cacheKey, func() (interface{}, error) {
-			cache.IncMisses()
-			promCacheMisses.Inc()
-			return fetchAndUpdateCache(r, cacheKey)
-		})
-
-		if err != nil {
-			http.Error(w, "Proxy Error", http.StatusInternalServerError)
-			return
-		}
-
-		item = v.(CacheItem)
-		w.Header().Set("Content-Type", item.ContentType)
-
-		if shared {
-			w.Header().Set("X-Lumina-Cache", "HIT-SHARED")
-			cache.IncHits()
-			promCacheHits.Inc()
-			// fmt.Printf("[SAVED] %s %s | %d ms\n", r.Method, r.URL.RequestURI(), time.Since(start).Milliseconds())
-		} else {
-			w.Header().Set("X-Lumina-Cache", "MISS")
-			// fmt.Printf("[MISS ] %s %s | %d ms\n", r.Method, r.URL.RequestURI(), time.Since(start).Milliseconds())
-		}
-
-		w.WriteHeader(item.StatusCode)
-		_, _ = w.Write(item.Body)
-	})
+	handler := newGateway(lb, cache, cb, ttl, staleTTL, limiter)
 
 	server := &http.Server{
-		Addr:    ":" + *portFlag,
-		Handler: handler,
+		Addr:              ":" + *portFlag,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	// 5. Graceful Shutdown
